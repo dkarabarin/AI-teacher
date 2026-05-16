@@ -13,6 +13,7 @@
 - **Гибридный поиск** — приоритет: PDF → веб-поиск → LLM
 - **Полная наблюдаемость через Langfuse** — трассировка всех запросов (опционально)
 - **Система Guardrails** — система безопасности
+
 ### 🛡️ Система безопасности (Guardrails)
 - **Защита от Prompt Injection** — блокировка попыток взлома и изменения поведения
 - **Защита от Jailbreak атак** — блокировка DAN, AIM и других техник обхода
@@ -94,7 +95,7 @@
         ```bash
         python bot-local.py
         ```
-    - Веб-версия (новая!):
+    - Веб-версия :
         ```bash
         python -m uvicorn web.api:app --reload --host 0.0.0.0 --port 8000
         ```
@@ -122,13 +123,13 @@
 
 ## 📁 Структура проекта
 ```plaintext
-thermodynamics-rag/
-├── books/                    # Папка с PDF-файлами
-├── web/                      # 🆕 Веб-интерфейс
+AI-teacher/
+├── books/                   # Папка с PDF-файлами
+├── cache/                   # Кэш FAISS индекса (создаётся автоматически)
+│   └── faiss_index.pkl      # Сохранённый векторный индекс
+├── web/                     # 🆕 Веб-интерфейс
 │   ├── api.py               # FastAPI сервер
-│   ├── static/              # Статические файлы
-│   │   └── index.html       # HTML интерфейс
-│   └── README.md            # Документация веб-версии
+│   └── __init__.py          # Маркер пакета
 ├── bot-local.py             # Основной скрипт ассистента
 ├── bot.py                   # Скрипт для запуска tg боте
 ├── rag.py                   # Модуль RAG (поиск, эмбеддинги)
@@ -137,6 +138,7 @@ thermodynamics-rag/
 ├── security_tester.py       # Скрипт запуска проверки безопансости
 ├── requirements.txt         # Зависимости
 ├── .env.example             # Шаблон переменных окружения
+├── .gitignore               # Исключения для Git
 ├── docker-compose.yml       # Для запуска Langfuse
 └── README.md                # Документация
 ```
@@ -147,8 +149,10 @@ thermodynamics-rag/
 | `/api/health` | GET   | Проверка работоспособности |
 | `/api/stats`  | GET   | Статистика системы     |
 | `/api/chat`   | POST  | Отправка сообщения     |
+| `/api/chat/stream`   | POST  | Отправка сообщения со стримингом    |
 | `/api/clear`  | POST  | Очистка истории        |
 | `/api/history`| GET   | Получение истории      |
+
 # ⚙️ Конфигурация окружения (.env)
 ## Ollama (локальная модель)
     OLLAMA_BASE=http://localhost:11434/v1
