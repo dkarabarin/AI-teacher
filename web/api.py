@@ -9,6 +9,7 @@ import sys
 import time
 import asyncio
 import json
+import re
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -22,10 +23,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from guardrails_light import guardrails
+from rag import ThermodynamicsKnowledgeBase
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Конфигурация
+# ============================================================================
+
+BOOKS_DIR = ROOT_DIR / "books"
+OLLAMA_BASE = "http://localhost:11434/v1"
+OLLAMA_MODEL = "qwen3:4b"
+
+# ============================================================================
+# Глобальная инициализация базы знаний (один раз)
+# ============================================================================
+
+print("\n" + "="*50)
+print("🚀 Инициализация ИИ-преподавателя")
+print("="*50)
+
+print("📚 Загрузка базы знаний...")
+knowledge_base = ThermodynamicsKnowledgeBase(BOOKS_DIR)
+knowledge_base.load()
+print("✅ База знаний готова\n")
 
 # ============================================================================
 # Загрузка бота
@@ -34,8 +56,6 @@ logger = logging.getLogger(__name__)
 get_answer = None
 get_answer_stream = None
 web_search = None
-knowledge_base = None
-OLLAMA_MODEL = "qwen3:4b"
 
 bot_local_path = ROOT_DIR / "bot-local.py"
 
@@ -49,8 +69,6 @@ if bot_local_path.exists():
         get_answer = getattr(bot_module, 'get_answer', None)
         get_answer_stream = getattr(bot_module, 'get_answer_stream', None)
         web_search = getattr(bot_module, 'web_search', None)
-        knowledge_base = getattr(bot_module, 'knowledge_base', None)
-        OLLAMA_MODEL = getattr(bot_module, 'OLLAMA_MODEL', 'qwen3:4b')
         
         logger.info("✅ Загружен bot-local.py")
     except Exception as e:
@@ -71,6 +89,51 @@ if get_answer_stream is None:
         yield json.dumps({"chunk": "", "source": source, "done": True}) + "\n"
 
 # ============================================================================
+# Система безопасности
+# ============================================================================
+
+class SecurityGuard:
+    """Упрощённая система безопасности"""
+    
+    # Академические паттерны (блокировка списывания)
+    ACADEMIC_PATTERNS = [
+        (r'(?i)(готовые? ответы?|списать|сдуть|срисовать)', 'cheating'),
+        (r'(?i)(сделай за меня|напиши за меня|реши за меня)', 'cheating'),
+        (r'(?i)(лабораторную за меня|курсовую за меня)', 'cheating'),
+        (r'(?i)(ответы на экзамен)', 'cheating'),
+    ]
+    
+    def check_academic(self, text: str) -> tuple[bool, str]:
+        """Проверка академической честности"""
+        for pattern, _ in self.ACADEMIC_PATTERNS:
+            if re.search(pattern, text):
+                return False, "📚 Запрос отклонён. Я помогаю учиться, но не даю готовые ответы."
+        return True, ""
+    
+    def check(self, message: str) -> tuple[bool, str]:
+        """Комплексная проверка"""
+        is_safe, msg = self.check_academic(message)
+        if not is_safe:
+            return False, msg
+        return True, ""
+
+
+security = SecurityGuard()
+
+# ============================================================================
+# Проверка Ollama
+# ============================================================================
+
+def check_ollama() -> bool:
+    """Проверка доступности Ollama"""
+    try:
+        import requests
+        response = requests.get(f"{OLLAMA_BASE}/models", timeout=3)
+        return response.status_code == 200
+    except:
+        return False
+
+# ============================================================================
 # Модели
 # ============================================================================
 
@@ -89,7 +152,7 @@ class ClearRequest(BaseModel):
     session_id: str
 
 # ============================================================================
-# Хранилище
+# Хранилище сессий
 # ============================================================================
 
 class SessionStore:
@@ -126,9 +189,11 @@ store = SessionStore()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Запуск сервера")
+    logger.info("🚀 Запуск веб-сервера")
+    stats = knowledge_base.get_stats()
+    logger.info(f"📚 База знаний: {stats.get('vectors', 0)} векторов")
     yield
-    logger.info("👋 Остановка")
+    logger.info("👋 Остановка сервера")
 
 app = FastAPI(title="ИИ преподаватель по ТТД и ТМО", lifespan=lifespan)
 
@@ -150,34 +215,32 @@ def health():
 
 @app.get("/api/stats")
 def stats():
-    kb_loaded = knowledge_base and hasattr(knowledge_base, '_loaded') and knowledge_base._loaded
+    kb_stats = knowledge_base.get_stats()
     web_avail = web_search and hasattr(web_search, 'is_available') and web_search.is_available()
+    ollama_ok = check_ollama()
     
     return {
-        "knowledge_base_loaded": kb_loaded,
+        "knowledge_base_loaded": kb_stats.get("loaded", False),
+        "knowledge_base_vectors": kb_stats.get("vectors", 0),
         "web_search_available": web_avail,
         "web_search_engine": web_search.get_engine_name() if web_search else "Нет",
         "ollama_model": OLLAMA_MODEL,
-        "ollama_available": True,
-        "total_sessions": len(store.sessions),
-        "guardrails": guardrails.get_status(),
-        "streaming_supported": True
+        "ollama_available": ollama_ok,
+        "total_sessions": len(store.sessions)
     }
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    """Обычный endpoint без стриминга (для тестирования и обратной совместимости)"""
-    logger.info(f"Обычный запрос: {req.message[:50]}...")
+    """Обычный endpoint без стриминга"""
+    logger.info(f"Запрос: {req.message[:50]}...")
     
     # Проверка безопасности
-    is_safe, error_msg, details = guardrails.check(req.message, req.session_id)
-    
+    is_safe, error_msg = security.check(req.message)
     if not is_safe:
-        logger.warning(f"Блокировка: {details.get('category')}")
         return ChatResponse(
             reply=error_msg,
             session_id=req.session_id,
-            source="🛡️ Guardrails",
+            source="🛡️ Безопасность",
             processing_time=0.0
         )
     
@@ -215,11 +278,10 @@ async def chat_stream(req: ChatRequest):
     logger.info(f"Stream запрос: {req.message[:50]}...")
     
     # Проверка безопасности
-    is_safe, error_msg, details = guardrails.check(req.message, req.session_id)
-    
+    is_safe, error_msg = security.check(req.message)
     if not is_safe:
         async def error_stream():
-            yield json.dumps({"chunk": error_msg, "source": "🛡️ Guardrails", "done": True}) + "\n"
+            yield json.dumps({"chunk": error_msg, "source": "🛡️ Безопасность", "done": True}) + "\n"
         return StreamingResponse(error_stream(), media_type="application/x-ndjson")
     
     store.get_or_create(req.session_id)
@@ -264,10 +326,10 @@ def clear(req: ClearRequest):
 
 
 # ============================================================================
-# HTML
+# HTML интерфейс
 # ============================================================================
-
-HTML_PAGE = r"""<!DOCTYPE html>
+HTML_PAGE = """
+<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
@@ -277,8 +339,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e, #16213e);
             min-height: 100vh;
             padding: 20px;
         }
@@ -326,10 +388,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             flex-direction: column;
             gap: 15px;
         }
-        .message {
-            display: flex;
-            gap: 10px;
-        }
+        .message { display: flex; gap: 10px; }
         .message.user { justify-content: flex-end; }
         .avatar {
             width: 36px;
@@ -350,29 +409,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
             background: white;
             box-shadow: 0 1px 2px rgba(0,0,0,0.1);
         }
-        .message.user .bubble {
-            background: #e94560;
-            color: white;
-        }
+        .message.user .bubble { background: #e94560; color: white; }
         .bubble-text { line-height: 1.5; }
-        .bubble-text p { margin-bottom: 8px; }
         .bubble-source {
             font-size: 0.7rem;
             margin-top: 6px;
             opacity: 0.7;
-        }
-        .cursor-blink {
-            display: inline-block;
-            width: 2px;
-            height: 1.2em;
-            background-color: #e94560;
-            margin-left: 2px;
-            animation: blink 1s step-end infinite;
-            vertical-align: middle;
-        }
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0; }
         }
         .input-area {
             padding: 15px 20px;
@@ -423,7 +465,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .dot:nth-child(2) { animation-delay: 0.2s; }
         .dot:nth-child(3) { animation-delay: 0.4s; }
         @keyframes bounce {
-            0%, 60%, 100% { transform: translateY(0); }
+            0%,60%,100% { transform: translateY(0); }
             30% { transform: translateY(-8px); }
         }
         @media (max-width: 768px) {
@@ -451,269 +493,135 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-(function() {
-    let sessionId = localStorage.getItem("session_id");
-    if (!sessionId) {
-        sessionId = crypto.randomUUID();
-        localStorage.setItem("session_id", sessionId);
+var sessionId = localStorage.getItem("session_id");
+if (!sessionId) {
+    sessionId = crypto.randomUUID();
+    localStorage.setItem("session_id", sessionId);
+}
+var isLoading = false;
+var chat = document.getElementById("chat");
+var input = document.getElementById("input");
+var sendBtn = document.getElementById("btn-send");
+var clearBtn = document.getElementById("btn-clear");
+var badgeKb = document.getElementById("badge-kb");
+var badgeWeb = document.getElementById("badge-web");
+var badgeGuard = document.getElementById("badge-guard");
+
+function formatText(text) {
+    if (!text) return "";
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\\*\\*(.*?)\\*\\*/g, "<strong>$1</strong>").replace(/\\n/g, "<br>");
+}
+
+function addUserMessage(text) {
+    var div = document.createElement("div");
+    div.className = "message user";
+    div.innerHTML = '<div class="avatar">👤</div><div class="bubble"><div class="bubble-text">' + formatText(text) + '</div></div>';
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+}
+
+function addBotMessage(text, source) {
+    var div = document.createElement("div");
+    div.className = "message bot";
+    var sourceHtml = source ? '<div class="bubble-source">' + source + '</div>' : "";
+    div.innerHTML = '<div class="avatar">🤖</div><div class="bubble"><div class="bubble-text">' + formatText(text) + '</div>' + sourceHtml + '</div>';
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+    if (window.MathJax) MathJax.typesetPromise([div]).catch(console.error);
+}
+
+function showTyping() {
+    var div = document.createElement("div");
+    div.id = "typing";
+    div.className = "typing";
+    div.innerHTML = '<div style="display:flex;gap:4px"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div><span>🤖 Преподаватель печатает...</span>';
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+}
+
+function hideTyping() {
+    var el = document.getElementById("typing");
+    if (el) el.remove();
+}
+
+function sendMessage() {
+    var message = input.value.trim();
+    if (!message || isLoading) return;
+    input.value = "";
+    input.style.height = "auto";
+    addUserMessage(message);
+    isLoading = true;
+    sendBtn.disabled = true;
+    showTyping();
+    fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: message, session_id: sessionId })
+    })
+    .then(function(response) { return response.json(); })
+    .then(function(data) {
+        hideTyping();
+        addBotMessage(data.reply, data.source);
+    })
+    .catch(function(error) {
+        hideTyping();
+        addBotMessage("❌ Ошибка: " + error.message);
+    })
+    .finally(function() {
+        isLoading = false;
+        sendBtn.disabled = false;
+        input.focus();
+    });
+}
+
+function clearChat() {
+    if (!confirm("Очистить историю диалога?")) return;
+    fetch("/api/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId })
+    })
+    .then(function() {
+        chat.innerHTML = "";
+        addBotMessage("🧹 История диалога очищена. Задайте новый вопрос!");
+    })
+    .catch(function(err) {
+        addBotMessage("❌ Ошибка очистки");
+    });
+}
+
+function loadStats() {
+    fetch("/api/stats")
+    .then(function(res) { return res.json(); })
+    .then(function(stats) {
+        if (badgeKb) badgeKb.innerHTML = stats.knowledge_base_loaded ? "📚 RAG ✅" : "📚 RAG ❌";
+        if (badgeWeb) badgeWeb.innerHTML = stats.web_search_available ? "🌐 Поиск ✅" : "🌐 Поиск ❌";
+        if (badgeGuard) badgeGuard.innerHTML = "🛡️ Guardrails ✅";
+    })
+    .catch(function(e) { console.log("Stats error:", e); });
+}
+
+function addWelcomeMessage() {
+    addBotMessage("👋 Здравствуйте! Я ИИ-преподаватель по технической термодинамике (ТТД) и тепломассообмену (ТМО).\\n\\nЗадайте мне вопрос по:\\n• 📚 Лабораторным работам\\n• 📊 Обработке данных\\n• 📖 Теоретическому материалу\\n• 🔬 Подготовке к экзаменам");
+}
+
+sendBtn.onclick = sendMessage;
+clearBtn.onclick = clearChat;
+input.onkeydown = function(e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
     }
-    
-    let isLoading = false;
-    let fullAnswer = "";
-    
-    const chat = document.getElementById("chat");
-    const input = document.getElementById("input");
-    const sendBtn = document.getElementById("btn-send");
-    const clearBtn = document.getElementById("btn-clear");
-    const badgeKb = document.getElementById("badge-kb");
-    const badgeWeb = document.getElementById("badge-web");
-    const badgeGuard = document.getElementById("badge-guard");
-    
-    function formatText(text) {
-        if (!text) return "";
-        let result = text;
-        result = result.replace(/&/g, "&amp;");
-        result = result.replace(/</g, "&lt;");
-        result = result.replace(/>/g, "&gt;");
-        result = result.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
-        result = result.replace(/\n/g, "<br>");
-        return result;
-    }
-    
-    function addUserMessage(content) {
-        const div = document.createElement("div");
-        div.className = "message user";
-        
-        const avatar = document.createElement("div");
-        avatar.className = "avatar";
-        avatar.textContent = "👤";
-        
-        const bubble = document.createElement("div");
-        bubble.className = "bubble";
-        
-        const textDiv = document.createElement("div");
-        textDiv.className = "bubble-text";
-        textDiv.innerHTML = formatText(content);
-        bubble.appendChild(textDiv);
-        
-        div.appendChild(avatar);
-        div.appendChild(bubble);
-        chat.appendChild(div);
-        chat.scrollTop = chat.scrollHeight;
-    }
-    
-    function createStreamingMessage() {
-        const div = document.createElement("div");
-        div.className = "message bot";
-        div.id = "streaming-message";
-        
-        const avatar = document.createElement("div");
-        avatar.className = "avatar";
-        avatar.textContent = "🤖";
-        
-        const bubble = document.createElement("div");
-        bubble.className = "bubble";
-        
-        const textDiv = document.createElement("div");
-        textDiv.className = "bubble-text";
-        
-        const contentSpan = document.createElement("span");
-        contentSpan.id = "streaming-content";
-        const cursorSpan = document.createElement("span");
-        cursorSpan.className = "cursor-blink";
-        
-        textDiv.appendChild(contentSpan);
-        textDiv.appendChild(cursorSpan);
-        bubble.appendChild(textDiv);
-        
-        const sourceDiv = document.createElement("div");
-        sourceDiv.className = "bubble-source";
-        sourceDiv.id = "streaming-source";
-        bubble.appendChild(sourceDiv);
-        
-        div.appendChild(avatar);
-        div.appendChild(bubble);
-        chat.appendChild(div);
-        chat.scrollTop = chat.scrollHeight;
-        
-        return { contentSpan, sourceDiv, cursorSpan };
-    }
-    
-    function updateStreaming(content, source, isDone) {
-        const contentSpan = document.getElementById("streaming-content");
-        const sourceDiv = document.getElementById("streaming-source");
-        const cursorSpan = document.querySelector(".cursor-blink");
-        
-        if (contentSpan) {
-            contentSpan.innerHTML = formatText(content);
-        }
-        if (sourceDiv && source) {
-            sourceDiv.textContent = source;
-        }
-        if (isDone && cursorSpan) {
-            cursorSpan.style.display = "none";
-        }
-        
-        if (window.MathJax && contentSpan) {
-            MathJax.typesetPromise([contentSpan]).catch(console.error);
-        }
-        
-        chat.scrollTop = chat.scrollHeight;
-    }
-    
-    function showLoading() {
-        const div = document.createElement("div");
-        div.id = "loading";
-        div.className = "typing";
-        div.innerHTML = '<div style="display:flex;gap:4px"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div><span>🤖 Преподаватель печатает...</span>';
-        chat.appendChild(div);
-        chat.scrollTop = chat.scrollHeight;
-    }
-    
-    function hideLoading() {
-        const el = document.getElementById("loading");
-        if (el) el.remove();
-    }
-    
-    async function sendMessage() {
-        const message = input.value.trim();
-        if (!message || isLoading) return;
-        
-        input.value = "";
-        input.style.height = "auto";
-        
-        addUserMessage(message);
-        
-        isLoading = true;
-        sendBtn.disabled = true;
-        showLoading();
-        
-        fullAnswer = "";
-        createStreamingMessage();
-        
-        try {
-            const response = await fetch("/api/chat/stream", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ message: message, session_id: sessionId, stream: true })
-            });
-            
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = "";
-            
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split("\n");
-                buffer = lines.pop() || "";
-                
-                for (const line of lines) {
-                    if (line.trim()) {
-                        try {
-                            const data = JSON.parse(line);
-                            if (data.chunk !== undefined) {
-                                fullAnswer += data.chunk;
-                                updateStreaming(fullAnswer, data.source, data.done);
-                            }
-                        } catch (e) {
-                            console.error("Parse error:", e);
-                        }
-                    }
-                }
-            }
-        } catch (error) {
-            console.error("Stream error:", error);
-            updateStreaming(fullAnswer + "\n\n❌ Ошибка: " + error.message, "⚠️ Ошибка", true);
-        } finally {
-            hideLoading();
-            isLoading = false;
-            sendBtn.disabled = false;
-            input.focus();
-        }
-    }
-    
-    async function clearChat() {
-        if (!confirm("Очистить историю диалога?")) return;
-        try {
-            await fetch("/api/clear", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ session_id: sessionId })
-            });
-            chat.innerHTML = "";
-            addWelcomeMessage();
-        } catch (err) {
-            console.error("Clear error:", err);
-        }
-    }
-    
-    async function loadStats() {
-        try {
-            const res = await fetch("/api/stats");
-            if (!res.ok) return;
-            const stats = await res.json();
-            
-            if (badgeKb) {
-                badgeKb.innerHTML = stats.knowledge_base_loaded ? "📚 RAG ✅" : "📚 RAG ❌";
-            }
-            if (badgeWeb) {
-                const engine = stats.web_search_engine || "Поиск";
-                badgeWeb.innerHTML = stats.web_search_available ? "🌐 " + engine + " ✅" : "🌐 Поиск ❌";
-            }
-            if (badgeGuard) {
-                badgeGuard.innerHTML = stats.guardrails?.active ? "🛡️ Guardrails ✅" : "🛡️ Guardrails ⚠️";
-            }
-        } catch(e) {
-            console.log("Stats error:", e);
-        }
-    }
-    
-    function addWelcomeMessage() {
-        const div = document.createElement("div");
-        div.className = "message bot";
-        
-        const avatar = document.createElement("div");
-        avatar.className = "avatar";
-        avatar.textContent = "🤖";
-        
-        const bubble = document.createElement("div");
-        bubble.className = "bubble";
-        
-        const textDiv = document.createElement("div");
-        textDiv.className = "bubble-text";
-        textDiv.innerHTML = "👋 Здравствуйте! Я ИИ-преподаватель по <strong>технической термодинамике (ТТД)</strong> и <strong>тепломассообмену (ТМО)</strong>.<br><br>Задайте мне вопрос по:<br>• 📚 Лабораторным работам<br>• 📊 Обработке данных<br>• 📖 Теоретическому материалу<br>• 🔬 Подготовке к экзаменам";
-        
-        bubble.appendChild(textDiv);
-        div.appendChild(avatar);
-        div.appendChild(bubble);
-        chat.appendChild(div);
-    }
-    
-    sendBtn.onclick = sendMessage;
-    clearBtn.onclick = clearChat;
-    
-    input.onkeydown = function(e) {
-        if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            sendMessage();
-        }
-    };
-    
-    input.oninput = function() {
-        this.style.height = "auto";
-        this.style.height = Math.min(this.scrollHeight, 120) + "px";
-    };
-    
-    loadStats();
-    setInterval(loadStats, 30000);
-    addWelcomeMessage();
-    input.focus();
-    
-    console.log("Chat initialized, sessionId:", sessionId);
-})();
+};
+input.oninput = function() {
+    this.style.height = "auto";
+    this.style.height = Math.min(this.scrollHeight, 120) + "px";
+};
+
+loadStats();
+setInterval(loadStats, 30000);
+addWelcomeMessage();
+input.focus();
 </script>
 </body>
 </html>
