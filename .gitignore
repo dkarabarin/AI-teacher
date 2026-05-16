@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+.env
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
+books/*.pdf
+!books/.gitkeep
+security_log.json
+security_attacks.log
+security_report_*.json
+security_assessment_*.json
+*.pyc
+web/__pycache__/
+web/*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
